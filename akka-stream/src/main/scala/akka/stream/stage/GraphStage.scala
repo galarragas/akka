@@ -5,20 +5,20 @@ package akka.stream.stage
 
 import java.util
 import java.util.concurrent.atomic.{ AtomicReferenceFieldUpdater, AtomicReference }
-
 import akka.actor._
 import akka.dispatch.sysmsg.{ DeathWatchNotification, SystemMessage, Unwatch, Watch }
 import akka.event.LoggingAdapter
 import akka.stream._
 import akka.stream.impl.StreamLayout.Module
 import akka.stream.impl.fusing.GraphInterpreter.GraphAssembly
-import akka.stream.impl.fusing.{ GraphInterpreter, GraphModule, GraphStageModule }
+import akka.stream.impl.fusing.{ GraphInterpreter, GraphModule, GraphStageModule, SubSource, SubSink }
 import akka.stream.impl.{ ReactiveStreamsCompliance, SeqActorName }
-
 import scala.annotation.tailrec
 import scala.collection.mutable.ArrayBuffer
 import scala.collection.{ immutable, mutable }
 import scala.concurrent.duration.FiniteDuration
+import akka.stream.impl.SubscriptionTimeoutException
+import akka.stream.actor.ActorSubscriberMessage
 
 abstract class GraphStageWithMaterializedValue[+S <: Shape, +M] extends Graph[S, M] {
 
@@ -868,7 +868,7 @@ abstract class GraphStageLogic private[stream] (val inCount: Int, val outCount: 
    *
    * This object can be cached and reused within the same [[GraphStageLogic]].
    */
-  final protected def getAsyncCallback[T](handler: T ⇒ Unit): AsyncCallback[T] = {
+  final def getAsyncCallback[T](handler: T ⇒ Unit): AsyncCallback[T] = {
     new AsyncCallback[T] {
       override def invoke(event: T): Unit =
         interpreter.onAsyncInput(GraphStageLogic.this, event, handler.asInstanceOf[Any ⇒ Unit])
@@ -941,6 +941,139 @@ abstract class GraphStageLogic private[stream] (val inCount: Int, val outCount: 
    * completeStage() or failStage() are explicitly called
    */
   def keepGoingAfterAllPortsClosed: Boolean = false
+
+  class SubSinkInlet[T](name: String) {
+    import ActorSubscriberMessage._
+
+    private var handler: InHandler = _
+    private var elem: T = null.asInstanceOf[T]
+    private var closed = false
+    private var pulled = false
+
+    private val _sink = new SubSink[T](getAsyncCallback[ActorSubscriberMessage] { msg ⇒
+      if (!closed) msg match {
+        case OnNext(e) ⇒
+          elem = e.asInstanceOf[T]
+          pulled = false
+          handler.onPush()
+        case OnComplete ⇒
+          closed = true
+          handler.onUpstreamFinish()
+        case OnError(ex) ⇒
+          closed = true
+          handler.onUpstreamFailure(ex)
+      }
+    }.invoke _)
+
+    def sink: Graph[SinkShape[T], Unit] = _sink
+
+    def setHandler(handler: InHandler): Unit = this.handler = handler
+
+    def isAvailable: Boolean = elem != null
+
+    def isClosed: Boolean = closed
+
+    def hasBeenPulled: Boolean = pulled
+
+    def grab(): T = {
+      require(elem != null, "cannot grab element from port when data have not yet arrived")
+      val ret = elem
+      elem = null.asInstanceOf[T]
+      ret
+    }
+
+    def pull(): Unit = {
+      require(!pulled, "cannot pull port twice")
+      require(!closed, "cannot pull closed port")
+      pulled = true
+      _sink.pullSubstream()
+    }
+
+    def cancel(): Unit = {
+      closed = true
+      _sink.cancelSubstream()
+    }
+  }
+
+  class SubSourceOutlet[T](name: String) {
+
+    private var handler: OutHandler = null
+    private var available = false
+    private var closed = false
+
+    private val onPull = getAsyncCallback[Unit] { _ ⇒
+      if (!closed) {
+        available = true
+        handler.onPull()
+      }
+    }.invoke _
+
+    private val onCancel = getAsyncCallback[Unit] { _ ⇒
+      if (!closed) {
+        available = false
+        closed = true
+        handler.onDownstreamFinish()
+      }
+    }.invoke _
+
+    private val _source = new SubSource[T](name, onPull, onCancel)
+
+    /**
+     * Set the source into timed-out mode if it has not yet been materialized.
+     */
+    def timeout(d: FiniteDuration): Unit = _source.timeout(d)
+
+    /**
+     * Get the Source for this dynamic output port.
+     */
+    def source: Graph[SourceShape[T], Unit] = _source
+
+    /**
+     * Set OutHandler for this dynamic output port; this needs to be done before
+     * the first substream callback can arrive.
+     */
+    def setHandler(handler: OutHandler): Unit = this.handler = handler
+
+    /**
+     * Returns `true` if this output port can be pushed.
+     */
+    def isAvailable: Boolean = available
+
+    /**
+     * Returns `true` if this output port is closed, but caution
+     * THIS WORKS DIFFERENTLY THAN THE NORMAL isClosed(out).
+     * Due to possibly asynchronous shutdown it may not return
+     * `true` immediately after `complete()` or `fail()` have returned.
+     */
+    def isClosed: Boolean = closed
+
+    /**
+     * Push to this output port.
+     */
+    def push(elem: T): Unit = {
+      available = false
+      _source.pushSubstream(elem)
+    }
+
+    /**
+     * Complete this output port.
+     */
+    def complete(): Unit = {
+      available = false
+      closed = true
+      _source.completeSubstream()
+    }
+
+    /**
+     * Fail this output port.
+     */
+    def fail(ex: Throwable): Unit = {
+      available = false
+      _source.failSubstream(ex)
+      closed = true
+    }
+  }
+
 }
 
 /**
@@ -972,10 +1105,11 @@ abstract class TimerGraphStageLogic(_shape: Shape) extends GraphStageLogic(_shap
 
   private def onInternalTimer(scheduled: Scheduled): Unit = {
     val Id = scheduled.timerId
-    keyToTimers.get(scheduled.timerKey) match {
+    val timerKey = scheduled.timerKey
+    keyToTimers.get(timerKey) match {
       case Some(Timer(Id, _)) ⇒
-        if (!scheduled.repeating) keyToTimers -= scheduled.timerKey
-        onTimer(scheduled.timerKey)
+        if (!scheduled.repeating) keyToTimers -= timerKey
+        onTimer(timerKey)
       case _ ⇒
     }
   }
