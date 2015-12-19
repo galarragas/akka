@@ -25,7 +25,7 @@ private[akka] object GraphInterpreter {
   /**
    * Compile time constant, enable it for debug logging to the console.
    */
-  final val Debug = true
+  final val Debug = false
 
   final val NoEvent = -1
   final val Boundary = -1
@@ -540,6 +540,22 @@ private[stream] final class GraphInterpreter(
     if (Debug) println(s"$Name ---------------- $queueStatus (running=$runningStages, shutdown=${shutdownCounter.mkString(",")})")
     // TODO: deadlock detection
   }
+
+  def executeAsyncInput(logic: GraphStageLogic, evt: Any, handler: (Any) ⇒ Unit): Unit =
+    if (!isStageCompleted(logic)) {
+      if (GraphInterpreter.Debug) println(s"$Name ASYNC $evt ($handler) [$logic]")
+      val currentInterpreterHolder = _currentInterpreter.get()
+      val previousInterpreter = currentInterpreterHolder(0)
+      currentInterpreterHolder(0) = this
+      try {
+        activeStage = logic
+        try handler(evt)
+        catch {
+          case NonFatal(ex) ⇒ logic.failStage(ex)
+        }
+        afterStageHasRun(logic)
+      } finally currentInterpreterHolder(0) = previousInterpreter
+    }
 
   // Decodes and processes a single event for the given connection
   private def processEvent(connection: Int): Unit = {

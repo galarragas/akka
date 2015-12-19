@@ -19,6 +19,7 @@ import scala.collection.{ immutable, mutable }
 import scala.concurrent.duration.FiniteDuration
 import akka.stream.impl.SubscriptionTimeoutException
 import akka.stream.actor.ActorSubscriberMessage
+import akka.stream.actor.ActorPublisherMessage
 
 abstract class GraphStageWithMaterializedValue[+S <: Shape, +M] extends Graph[S, M] {
 
@@ -950,7 +951,7 @@ abstract class GraphStageLogic private[stream] (val inCount: Int, val outCount: 
     private var closed = false
     private var pulled = false
 
-    private val _sink = new SubSink[T](getAsyncCallback[ActorSubscriberMessage] { msg ⇒
+    private val _sink = new SubSink[T](name, getAsyncCallback[ActorSubscriberMessage] { msg ⇒
       if (!closed) msg match {
         case OnNext(e) ⇒
           elem = e.asInstanceOf[T]
@@ -1001,27 +1002,27 @@ abstract class GraphStageLogic private[stream] (val inCount: Int, val outCount: 
     private var available = false
     private var closed = false
 
-    private val onPull = getAsyncCallback[Unit] { _ ⇒
-      if (!closed) {
-        available = true
-        handler.onPull()
-      }
-    }.invoke _
+    private val callback = getAsyncCallback[ActorPublisherMessage] {
+      case SubSink.RequestOne ⇒
+        if (!closed) {
+          available = true
+          handler.onPull()
+        }
+      case ActorPublisherMessage.Cancel ⇒
+        if (!closed) {
+          available = false
+          closed = true
+          handler.onDownstreamFinish()
+        }
+    }
 
-    private val onCancel = getAsyncCallback[Unit] { _ ⇒
-      if (!closed) {
-        available = false
-        closed = true
-        handler.onDownstreamFinish()
-      }
-    }.invoke _
-
-    private val _source = new SubSource[T](name, onPull, onCancel)
+    private val _source = new SubSource[T](name, callback)
 
     /**
      * Set the source into timed-out mode if it has not yet been materialized.
      */
-    def timeout(d: FiniteDuration): Unit = _source.timeout(d)
+    def timeout(d: FiniteDuration): Unit =
+      if (_source.timeout(d)) closed = true
 
     /**
      * Get the Source for this dynamic output port.
@@ -1069,8 +1070,8 @@ abstract class GraphStageLogic private[stream] (val inCount: Int, val outCount: 
      */
     def fail(ex: Throwable): Unit = {
       available = false
-      _source.failSubstream(ex)
       closed = true
+      _source.failSubstream(ex)
     }
   }
 

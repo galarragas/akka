@@ -395,14 +395,7 @@ private[stream] final class GraphInterpreterShell(
         resumeScheduled = false
         if (interpreter.isSuspended) runBatch()
       case AsyncInput(_, logic, event, handler) ⇒
-        if (GraphInterpreter.Debug) println(s"${interpreter.Name} ASYNC $event ($handler) [$logic]")
-        if (!interpreter.isStageCompleted(logic)) {
-          try handler(event)
-          catch {
-            case NonFatal(e) ⇒ logic.failStage(e)
-          }
-          interpreter.afterStageHasRun(logic)
-        }
+        interpreter.executeAsyncInput(logic, event, handler)
         runBatch()
 
       // Initialization and completion messages
@@ -529,7 +522,7 @@ private[stream] class ActorGraphInterpreter(_initial: GraphInterpreterShell) ext
    */
   @tailrec private def finishShellRegistration(): Unit =
     newShells match {
-      case Nil ⇒
+      case Nil ⇒ if (activeInterpreters.isEmpty) context.stop(self)
       case shell :: tail ⇒
         newShells = tail
         if (shell.isInitialized) {
@@ -546,11 +539,11 @@ private[stream] class ActorGraphInterpreter(_initial: GraphInterpreterShell) ext
   override def receive: Receive = {
     case b: BoundaryEvent ⇒
       val shell = b.shell
-      if (shell.isInitialized || tryInit(shell)) {
+      if (!shell.isTerminated && (shell.isInitialized || tryInit(shell))) {
         shell.receive(b)
         if (shell.isTerminated) {
           activeInterpreters -= shell
-          if (activeInterpreters.isEmpty) context.stop(self)
+          if (activeInterpreters.isEmpty && newShells.isEmpty) context.stop(self)
         }
       }
     case Resume ⇒ finishShellRegistration()
